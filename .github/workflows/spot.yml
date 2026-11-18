@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       quality:
-        description: "Download quality (256kbps requires the YT_COOKIES secret)"
+        description: "Download quality (256kbps requires YT_COOKIES + High Quality account setting)"
         required: true
         type: choice
         options:
@@ -63,81 +63,123 @@ jobs:
           ffmpeg -version | head -n 1
           deno --version
 
-      - name: Download audio
+      - name: Prepare cookies
         env:
-          SPOTIFY_URL: ${{ inputs.spotify_url }}
-          QUALITY: ${{ inputs.quality }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          mkdir -p downloads
-          COOKIE_FLAG=""
-          if [ "$QUALITY" = "256kbps" ]; then
-            if [ -z "$YT_COOKIES" ]; then
-              echo "::error::quality=256kbps selected but the YT_COOKIES secret is empty."
-              exit 1
-            fi
-            printf '%s\n' "$YT_COOKIES" > cookies.txt
-            COOKIE_FLAG="--cookie-file cookies.txt"
+          if [ -z "$YT_COOKIES" ]; then
+            echo "::error::YT_COOKIES secret is empty. GitHub runner IPs are blocked by YouTube bot detection, so cookies are mandatory. Export cookies from music.youtube.com and add them as a repository secret."
+            exit 1
+          fi
+          printf '%s\n' "$YT_COOKIES" | tr -d '\r' > cookies.txt
+          LINES=$(wc -l < cookies.txt)
+          echo "cookies.txt written: $LINES lines"
+          echo "First line: $(head -1 cookies.txt)"
+          if ! head -1 cookies.txt | grep -qi "netscape"; then
+            echo "::warning::cookies.txt first line doesn't mention 'Netscape'. Expected: '# Netscape HTTP Cookie File'. The file may be in JSON format instead of Netscape."
+          fi
+          if ! grep -q "youtube.com" cookies.txt; then
+            echo "::error::cookies.txt contains no youtube.com cookies. Re-export while logged in at music.youtube.com."
+            exit 1
           fi
 
+      - name: Download audio (YouTube Music)
+        env:
+          SPOTIFY_URL: ${{ inputs.spotify_url }}
+        run: |
+          mkdir -p downloads
+          set +e
           spotdl download "$SPOTIFY_URL" \
             --output "downloads/{artist}/{title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
-            $COOKIE_FLAG \
-            --m3u \
+            --cookie-file cookies.txt \
             --generate-lrc \
             --lyrics synced genius \
             --restrict ascii \
             --print-errors 2>&1 | tee spotdl-errors.log
           RC=${PIPESTATUS[0]}
-          rm -f cookies.txt
+          echo "First pass exit code: $RC"
           if [ "$RC" -ne 0 ]; then
-            echo "::warning::spotdl first pass exited with code $RC — retry step will attempt remaining tracks."
+            echo "::warning::spotdl first pass failed with exit code $RC"
+            echo "--- Last 30 lines of spotdl log ---"
+            tail -30 spotdl-errors.log
+            echo "--- End of log tail ---"
           fi
+          exit 0
+
+      - name: Fallback download (regular YouTube)
+        env:
+          SPOTIFY_URL: ${{ inputs.spotify_url }}
+        run: |
+          if find downloads -type f -name '*.m4a' | grep -q .; then
+            echo "First pass produced files — skipping fallback."
+            exit 0
+          fi
+          echo "First pass produced no files. Trying --audio youtube as fallback..."
+          set +e
+          spotdl download "$SPOTIFY_URL" \
+            --output "downloads/{artist}/{title}.{output-ext}" \
+            --format m4a \
+            --bitrate disable \
+            --audio youtube \
+            --cookie-file cookies.txt \
+            --generate-lrc \
+            --lyrics synced genius \
+            --restrict ascii \
+            --print-errors 2>&1 | tee -a spotdl-errors.log
+          RC=${PIPESTATUS[0]}
+          echo "Fallback pass exit code: $RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::Fallback also failed"
+            echo "--- Last 30 lines of spotdl log ---"
+            tail -30 spotdl-errors.log
+          fi
+          exit 0
 
       - name: Retry failed tracks
         env:
           SPOTIFY_URL: ${{ inputs.spotify_url }}
-          QUALITY: ${{ inputs.quality }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          COOKIE_FLAG=""
-          if [ "$QUALITY" = "256kbps" ]; then
-            if [ -z "$YT_COOKIES" ]; then
-              echo "::error::quality=256kbps selected but the YT_COOKIES secret is empty."
-              exit 1
-            fi
-            printf '%s\n' "$YT_COOKIES" > cookies.txt
-            COOKIE_FLAG="--cookie-file cookies.txt"
-          fi
-
+          set +e
           spotdl download "$SPOTIFY_URL" \
             --output "downloads/{artist}/{title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
-            $COOKIE_FLAG \
-            --m3u \
+            --cookie-file cookies.txt \
             --generate-lrc \
             --lyrics synced genius \
             --restrict ascii \
             --overwrite skip \
             --print-errors 2>&1 | tee -a spotdl-errors.log
           RC=${PIPESTATUS[0]}
-          rm -f cookies.txt
-          if [ "$RC" -ne 0 ]; then
-            echo "::warning::spotdl retry pass exited with code $RC."
-          fi
+          echo "Retry pass exit code: $RC"
+          exit 0
+
+      - name: Cleanup cookies
+        if: always()
+        run: rm -f cookies.txt
 
       - name: Verify downloads
         run: |
+          echo "--- Contents of downloads/ ---"
+          find downloads -type f | head -50
+          echo "--- File count: $(find downloads -type f -name '*.m4a' | wc -l) ---"
+
           if ! find downloads -type f -name '*.m4a' | grep -q .; then
-            echo "::error::No audio files were downloaded"
+            echo "::error::No audio files were downloaded. Below is the spotdl log — the actual error is in there:"
+            echo "===== SPOTDL LOG (last 80 lines) ====="
+            tail -80 spotdl-errors.log 2>/dev/null || echo "(spotdl-errors.log not found)"
+            echo "===== END LOG ====="
+            echo ""
+            echo "Common causes:"
+            echo "  1. YT_COOKIES expired → re-export from music.youtube.com"
+            echo "  2. YouTube IP-blocked the runner → retry the run (GitHub IPs rotate)"
+            echo "  3. Track region-locked → try a different track"
             exit 1
           fi
-          echo "Audio file count: $(find downloads -type f -name '*.m4a' | wc -l)"
           echo "Total download size: $(du -sh downloads | cut -f1)"
 
       - name: Stash output outside git tree
@@ -155,17 +197,14 @@ jobs:
           if [ -z "$BRANCH" ]; then
             BRANCH=$(date -u +%Y-%m-%d)
           fi
-
           if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
             echo "::error::Refusing to force-push to protected branch '$BRANCH'."
             exit 1
           fi
-
           echo "Pushing to branch: $BRANCH"
           git checkout --orphan "$BRANCH"
           git rm -rf . || true
           git clean -fdx || true
-
           cp -a "$RUNNER_TEMP/spotdl-out/." .
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
