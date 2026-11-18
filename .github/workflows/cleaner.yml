@@ -5,13 +5,18 @@ on:
     - cron: '0 3 * * *'   # daily at 03:00 UTC
   workflow_dispatch:
     inputs:
+      delete_all:
+        description: "⚠️ DELETE ALL matching branches (ignores retention_days and keep_latest — requires dry_run=false)"
+        required: false
+        type: boolean
+        default: false
       retention_days:
-        description: "Delete branches older than N days"
+        description: "Delete branches older than N days (ignored when delete_all=true)"
         required: false
         default: "30"
         type: string
       keep_latest:
-        description: "Always keep the N most recent branches (by date in name)"
+        description: "Always keep the N most recent branches (ignored when delete_all=true)"
         required: false
         default: "5"
         type: string
@@ -39,26 +44,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Delete old branches
+      - name: Safety check — delete_all requires dry_run=false
+        if: ${{ inputs.delete_all == true && inputs.dry_run == true }}
+        run: |
+          echo "::warning::delete_all=true but dry_run=true — running as PREVIEW ONLY."
+          echo "::notice::To actually delete all branches, uncheck 'dry_run' and re-run."
+
+      - name: Delete branches
         env:
           RETENTION_DAYS: ${{ inputs.retention_days || '30' }}
           KEEP_LATEST:    ${{ inputs.keep_latest    || '5' }}
-          DRY_RUN:        ${{ inputs.dry_run }}
+          DRY_RUN:        ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          DELETE_ALL:     ${{ github.event_name == 'workflow_dispatch' && inputs.delete_all || 'false' }}
         run: |
-          # Only branches matching the auto-generated naming pattern are candidates.
-          # Handles both new format (2026-11-18-r12) and legacy format (2026-11-18).
           PATTERN='^[0-9]{4}-[0-9]{2}-[0-9]{2}(-r[0-9]+)?$'
           CUTOFF_DATE=$(date -u -d "${RETENTION_DAYS} days ago" +%Y-%m-%d)
           CUTOFF_EPOCH=$(date -u -d "$CUTOFF_DATE" +%s)
 
-          echo "Retention  : ${RETENTION_DAYS} days (cutoff: ${CUTOFF_DATE})"
-          echo "Keep latest: ${KEEP_LATEST}"
-          echo "Dry run    : ${DRY_RUN:-false (scheduled)}"
+          echo "Mode       : $([ "$DELETE_ALL" = "true" ] && echo 'DELETE ALL' || echo 'Retention-based')"
+          echo "Dry run    : ${DRY_RUN:-false}"
+          if [ "$DELETE_ALL" = "true" ]; then
+            echo "Retention  : (ignored — delete_all is ON)"
+            echo "Keep latest: (ignored — delete_all is ON)"
+          else
+            echo "Retention  : ${RETENTION_DAYS} days (cutoff: ${CUTOFF_DATE})"
+            echo "Keep latest: ${KEEP_LATEST}"
+          fi
           echo "---"
 
           git fetch --all --prune --quiet
 
-          # List remote branches matching pattern, newest first, skip 'HEAD'
           ALL=$(git branch -r | sed 's|^\s*origin/||' | grep -E "$PATTERN" | grep -v '^HEAD$' | sort -r || true)
           if [ -z "$ALL" ]; then
             echo "No branches match the naming pattern — nothing to do."
@@ -70,10 +85,14 @@ jobs:
           echo "$ALL"
           echo "---"
 
-          # Skip the N most recent (regardless of age)
-          TO_CONSIDER=$(echo "$ALL" | tail -n +$((KEEP_LATEST + 1)) || true)
-          if [ -z "$TO_CONSIDER" ]; then
-            echo "Only ${KEEP_LATEST} or fewer branches exist — keeping all."
+          if [ "$DELETE_ALL" = "true" ]; then
+            CANDIDATES="$ALL"
+          else
+            CANDIDATES=$(echo "$ALL" | tail -n +$((KEEP_LATEST + 1)) || true)
+          fi
+
+          if [ -z "$CANDIDATES" ]; then
+            echo "Nothing to delete (keep_latest=${KEEP_LATEST} covers all branches)."
             exit 0
           fi
 
@@ -81,7 +100,7 @@ jobs:
           KEPT=0
           FAILED=0
 
-          for branch in $TO_CONSIDER; do
+          for branch in $CANDIDATES; do
             BRANCH_DATE=$(echo "$branch" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
             if [ -z "$BRANCH_DATE" ]; then
               echo "SKIP        : $branch (unparseable date)"
@@ -89,7 +108,14 @@ jobs:
             fi
             BRANCH_EPOCH=$(date -u -d "$BRANCH_DATE" +%s)
 
-            if [ "$BRANCH_EPOCH" -lt "$CUTOFF_EPOCH" ]; then
+            SHOULD_DELETE=false
+            if [ "$DELETE_ALL" = "true" ]; then
+              SHOULD_DELETE=true
+            elif [ "$BRANCH_EPOCH" -lt "$CUTOFF_EPOCH" ]; then
+              SHOULD_DELETE=true
+            fi
+
+            if [ "$SHOULD_DELETE" = "true" ]; then
               if [ "$DRY_RUN" = "true" ]; then
                 echo "WOULD DELETE: $branch (dated $BRANCH_DATE)"
                 DELETED=$((DELETED + 1))
@@ -115,4 +141,3 @@ jobs:
           else
             echo "Summary: ${DELETED} deleted, ${KEPT} kept, ${FAILED} failed."
           fi
-        
