@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       branch_name:
-        description: "Branch name override (default: UTC date YYYY-MM-DD)"
+        description: "Branch name override (default: UTC date + run number, e.g. 2026-11-18-r12)"
         required: false
         type: string
 
@@ -231,11 +231,11 @@ jobs:
       - name: Push to orphan branch (batched)
         env:
           BRANCH_INPUT: ${{ inputs.branch_name }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          # --- Branch setup ---
-          BRANCH="${BRANCH_INPUT:-$(date -u +%Y-%m-%d)}"
+          BRANCH="${BRANCH_INPUT:-$(date -u +%Y-%m-%d)-r${RUN_NUMBER}}"
           BRANCH=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//; s/\.lock$//')
-          if [ -z "$BRANCH" ]; then BRANCH=$(date -u +%Y-%m-%d); fi
+          if [ -z "$BRANCH" ]; then BRANCH="$(date -u +%Y-%m-%d)-r${RUN_NUMBER}"; fi
           if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
             echo "::error::Refusing to force-push to protected branch '$BRANCH'."
             exit 1
@@ -250,9 +250,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # --- Batching config ---
-          BATCH_SIZE_LIMIT=$((1500 * 1024 * 1024))   # 1.5 GB per batch (safe margin under 2 GB push limit)
-          PUSH_DELAY_SECONDS=10                       # pause between pushes to avoid rate limits
+          BATCH_SIZE_LIMIT=$((1500 * 1024 * 1024))
+          PUSH_DELAY_SECONDS=10
           CURRENT_BATCH_SIZE=0
           BATCH_NUM=1
           COMMIT_MADE=0
@@ -264,7 +263,6 @@ jobs:
             TOTAL_FILES=$((TOTAL_FILES + 1))
             FILE_SIZE=$(stat -c%s "$file")
 
-            # If adding this file would exceed the batch limit, commit & push what we have
             if [ $((CURRENT_BATCH_SIZE + FILE_SIZE)) -gt $BATCH_SIZE_LIMIT ] && [ "$CURRENT_BATCH_SIZE" -gt 0 ]; then
               echo ""
               echo "=== Batch $BATCH_NUM: $((CURRENT_BATCH_SIZE / 1024 / 1024)) MB ==="
@@ -290,7 +288,6 @@ jobs:
             CURRENT_BATCH_SIZE=$((CURRENT_BATCH_SIZE + FILE_SIZE))
           done < <(find . -type f -not -path './.git/*' -print0)
 
-          # Final batch (whatever remains)
           if [ "$CURRENT_BATCH_SIZE" -gt 0 ]; then
             echo ""
             echo "=== Final batch ($BATCH_NUM): $((CURRENT_BATCH_SIZE / 1024 / 1024)) MB ==="
