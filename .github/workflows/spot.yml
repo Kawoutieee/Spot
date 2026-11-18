@@ -1,0 +1,175 @@
+name: SpotDL Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      spotify_url:
+        description: "Public Spotify playlist/album/track URL"
+        required: true
+        type: string
+      quality:
+        description: "Download quality (256kbps requires the YT_COOKIES secret)"
+        required: true
+        type: choice
+        options:
+          - 128kbps
+          - 256kbps
+        default: 128kbps
+      branch_name:
+        description: "Branch name override (default: UTC date YYYY-MM-DD)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spotdl-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install spotdl
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install spotdl
+
+      - name: Print versions
+        run: |
+          spotdl --version
+          ffmpeg -version | head -n 1
+          deno --version
+
+      - name: Download audio
+        env:
+          SPOTIFY_URL: ${{ inputs.spotify_url }}
+          QUALITY: ${{ inputs.quality }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          mkdir -p downloads
+          COOKIE_FLAG=""
+          if [ "$QUALITY" = "256kbps" ]; then
+            if [ -z "$YT_COOKIES" ]; then
+              echo "::error::quality=256kbps selected but the YT_COOKIES secret is empty."
+              exit 1
+            fi
+            printf '%s\n' "$YT_COOKIES" > cookies.txt
+            COOKIE_FLAG="--cookie-file cookies.txt"
+          fi
+
+          spotdl download "$SPOTIFY_URL" \
+            --output "downloads/{artist}/{title}.{output-ext}" \
+            --format m4a \
+            --bitrate disable \
+            --audio youtube-music \
+            $COOKIE_FLAG \
+            --m3u \
+            --generate-lrc \
+            --lyrics synced genius \
+            --restrict ascii \
+            --print-errors 2>&1 | tee spotdl-errors.log
+          RC=${PIPESTATUS[0]}
+          rm -f cookies.txt
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::spotdl first pass exited with code $RC — retry step will attempt remaining tracks."
+          fi
+
+      - name: Retry failed tracks
+        env:
+          SPOTIFY_URL: ${{ inputs.spotify_url }}
+          QUALITY: ${{ inputs.quality }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          COOKIE_FLAG=""
+          if [ "$QUALITY" = "256kbps" ]; then
+            if [ -z "$YT_COOKIES" ]; then
+              echo "::error::quality=256kbps selected but the YT_COOKIES secret is empty."
+              exit 1
+            fi
+            printf '%s\n' "$YT_COOKIES" > cookies.txt
+            COOKIE_FLAG="--cookie-file cookies.txt"
+          fi
+
+          spotdl download "$SPOTIFY_URL" \
+            --output "downloads/{artist}/{title}.{output-ext}" \
+            --format m4a \
+            --bitrate disable \
+            --audio youtube-music \
+            $COOKIE_FLAG \
+            --m3u \
+            --generate-lrc \
+            --lyrics synced genius \
+            --restrict ascii \
+            --overwrite skip \
+            --print-errors 2>&1 | tee -a spotdl-errors.log
+          RC=${PIPESTATUS[0]}
+          rm -f cookies.txt
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::spotdl retry pass exited with code $RC."
+          fi
+
+      - name: Verify downloads
+        run: |
+          if ! find downloads -type f -name '*.m4a' | grep -q .; then
+            echo "::error::No audio files were downloaded"
+            exit 1
+          fi
+          echo "Audio file count: $(find downloads -type f -name '*.m4a' | wc -l)"
+          echo "Total download size: $(du -sh downloads | cut -f1)"
+
+      - name: Stash output outside git tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/spotdl-out"
+          cp -a downloads/. "$RUNNER_TEMP/spotdl-out/"
+          cp -f spotdl-errors.log "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
+
+      - name: Push to orphan branch
+        env:
+          BRANCH_INPUT: ${{ inputs.branch_name }}
+        run: |
+          BRANCH="${BRANCH_INPUT:-$(date -u +%Y-%m-%d)}"
+          BRANCH=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//; s/\.lock$//')
+          if [ -z "$BRANCH" ]; then
+            BRANCH=$(date -u +%Y-%m-%d)
+          fi
+
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            echo "::error::Refusing to force-push to protected branch '$BRANCH'."
+            exit 1
+          fi
+
+          echo "Pushing to branch: $BRANCH"
+          git checkout --orphan "$BRANCH"
+          git rm -rf . || true
+          git clean -fdx || true
+
+          cp -a "$RUNNER_TEMP/spotdl-out/." .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "spotdl download $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --force origin "$BRANCH"
