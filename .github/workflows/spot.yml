@@ -15,6 +15,11 @@ on:
           - 128kbps
           - 256kbps
         default: 128kbps
+      enforce_256kbps:
+        description: "Remove tracks below 200kbps and fail if all are removed (default: keep everything)"
+        required: false
+        type: boolean
+        default: false
       branch_name:
         description: "Branch name override (default: UTC date YYYY-MM-DD)"
         required: false
@@ -30,7 +35,7 @@ concurrency:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -68,7 +73,7 @@ jobs:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           if [ -z "$YT_COOKIES" ]; then
-            echo "::error::YT_COOKIES secret is empty. GitHub runner IPs are blocked by YouTube bot detection, so cookies are mandatory. Export cookies from music.youtube.com and add them as a repository secret."
+            echo "::error::YT_COOKIES secret is empty. Export cookies from music.youtube.com and add them as a repository secret."
             exit 1
           fi
           printf '%s\n' "$YT_COOKIES" | tr -d '\r' > cookies.txt
@@ -76,7 +81,7 @@ jobs:
           echo "cookies.txt written: $LINES lines"
           echo "First line: $(head -1 cookies.txt)"
           if ! head -1 cookies.txt | grep -qi "netscape"; then
-            echo "::warning::cookies.txt first line doesn't mention 'Netscape'. Expected: '# Netscape HTTP Cookie File'. The file may be in JSON format instead of Netscape."
+            echo "::warning::cookies.txt first line doesn't mention 'Netscape'. Expected: '# Netscape HTTP Cookie File'."
           fi
           if ! grep -q "youtube.com" cookies.txt; then
             echo "::error::cookies.txt contains no youtube.com cookies. Re-export while logged in at music.youtube.com."
@@ -90,7 +95,7 @@ jobs:
           mkdir -p downloads
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{artist}/{title}.{output-ext}" \
+            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
@@ -105,7 +110,6 @@ jobs:
             echo "::warning::spotdl first pass failed with exit code $RC"
             echo "--- Last 30 lines of spotdl log ---"
             tail -30 spotdl-errors.log
-            echo "--- End of log tail ---"
           fi
           exit 0
 
@@ -120,7 +124,7 @@ jobs:
           echo "First pass produced no files. Trying --audio youtube as fallback..."
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{artist}/{title}.{output-ext}" \
+            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube \
@@ -133,7 +137,6 @@ jobs:
           echo "Fallback pass exit code: $RC"
           if [ "$RC" -ne 0 ]; then
             echo "::warning::Fallback also failed"
-            echo "--- Last 30 lines of spotdl log ---"
             tail -30 spotdl-errors.log
           fi
           exit 0
@@ -144,7 +147,7 @@ jobs:
         run: |
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{artist}/{title}.{output-ext}" \
+            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
@@ -162,52 +165,142 @@ jobs:
         if: always()
         run: rm -f cookies.txt
 
+      - name: Enforce 256kbps minimum quality
+        if: ${{ inputs.enforce_256kbps == true }}
+        run: |
+          echo "Enforcement ON — scanning for tracks below 200kbps..."
+          REMOVED_FILE="$RUNNER_TEMP/removed-128kbps.txt"
+          : > "$REMOVED_FILE"
+          REMOVED_COUNT=0
+          TOTAL=0
+
+          while IFS= read -r -d '' file; do
+            TOTAL=$((TOTAL + 1))
+            BITRATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null || echo "")
+            if [ -z "$BITRATE" ] || [ "$BITRATE" = "N/A" ]; then
+              echo "::warning::Could not determine bitrate for: $file (keeping)"
+              continue
+            fi
+            KBPS=$((BITRATE / 1000))
+            if [ "$KBPS" -lt 200 ]; then
+              echo "::warning::Removing ${KBPS}kbps track: $file"
+              echo "${KBPS}kbps	${file#downloads/}" >> "$REMOVED_FILE"
+              rm -f "$file"
+              LRC_FILE="${file%.m4a}.lrc"
+              if [ -f "$LRC_FILE" ]; then
+                rm -f "$LRC_FILE"
+                echo "  (also removed sidecar: $LRC_FILE)"
+              fi
+              REMOVED_COUNT=$((REMOVED_COUNT + 1))
+            fi
+          done < <(find downloads -type f -name '*.m4a' -print0)
+
+          echo ""
+          echo "Checked $TOTAL file(s). Removed $REMOVED_COUNT file(s) below 200kbps."
+
+          if [ "$REMOVED_COUNT" -gt 0 ]; then
+            echo ""
+            echo "===== REMOVED FILES ====="
+            cat "$REMOVED_FILE"
+            echo "========================="
+          fi
+
       - name: Verify downloads
         run: |
-          echo "--- Contents of downloads/ ---"
-          find downloads -type f | head -50
-          echo "--- File count: $(find downloads -type f -name '*.m4a' | wc -l) ---"
+          COUNT=$(find downloads -type f -name '*.m4a' | wc -l)
+          echo "Audio file count: $COUNT"
+          echo "Total download size: $(du -sh downloads | cut -f1)"
+          echo "--- Tree ---"
+          find downloads -type f | head -40
 
-          if ! find downloads -type f -name '*.m4a' | grep -q .; then
-            echo "::error::No audio files were downloaded. Below is the spotdl log — the actual error is in there:"
-            echo "===== SPOTDL LOG (last 80 lines) ====="
-            tail -80 spotdl-errors.log 2>/dev/null || echo "(spotdl-errors.log not found)"
-            echo "===== END LOG ====="
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No audio files were downloaded. Below is the spotdl log:"
+            tail -80 spotdl-errors.log 2>/dev/null || echo "(log not found)"
             echo ""
-            echo "Common causes:"
-            echo "  1. YT_COOKIES expired → re-export from music.youtube.com"
-            echo "  2. YouTube IP-blocked the runner → retry the run (GitHub IPs rotate)"
-            echo "  3. Track region-locked → try a different track"
+            echo "If enforcement is ON, all tracks may have been below 200kbps and removed. Check the 'Enforce 256kbps' step above."
             exit 1
           fi
-          echo "Total download size: $(du -sh downloads | cut -f1)"
 
       - name: Stash output outside git tree
         run: |
           mkdir -p "$RUNNER_TEMP/spotdl-out"
           cp -a downloads/. "$RUNNER_TEMP/spotdl-out/"
           cp -f spotdl-errors.log "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
+          cp -f "$RUNNER_TEMP/removed-128kbps.txt" "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
 
-      - name: Push to orphan branch
+      - name: Push to orphan branch (batched)
         env:
           BRANCH_INPUT: ${{ inputs.branch_name }}
         run: |
+          # --- Branch setup ---
           BRANCH="${BRANCH_INPUT:-$(date -u +%Y-%m-%d)}"
           BRANCH=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//; s/[-.]+$//; s/\.lock$//')
-          if [ -z "$BRANCH" ]; then
-            BRANCH=$(date -u +%Y-%m-%d)
-          fi
+          if [ -z "$BRANCH" ]; then BRANCH=$(date -u +%Y-%m-%d); fi
           if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
             echo "::error::Refusing to force-push to protected branch '$BRANCH'."
             exit 1
           fi
           echo "Pushing to branch: $BRANCH"
+
           git checkout --orphan "$BRANCH"
           git rm -rf . || true
           git clean -fdx || true
           cp -a "$RUNNER_TEMP/spotdl-out/." .
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "spotdl download $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push --force origin "$BRANCH"
+
+          # --- Batching config ---
+          BATCH_SIZE_LIMIT=$((1500 * 1024 * 1024))   # 1.5 GB per batch (safe margin under 2 GB push limit)
+          PUSH_DELAY_SECONDS=10                       # pause between pushes to avoid rate limits
+          CURRENT_BATCH_SIZE=0
+          BATCH_NUM=1
+          COMMIT_MADE=0
+          TOTAL_FILES=0
+
+          echo "Batching: max $((BATCH_SIZE_LIMIT / 1024 / 1024)) MB per push, ${PUSH_DELAY_SECONDS}s delay between pushes"
+
+          while IFS= read -r -d '' file; do
+            TOTAL_FILES=$((TOTAL_FILES + 1))
+            FILE_SIZE=$(stat -c%s "$file")
+
+            # If adding this file would exceed the batch limit, commit & push what we have
+            if [ $((CURRENT_BATCH_SIZE + FILE_SIZE)) -gt $BATCH_SIZE_LIMIT ] && [ "$CURRENT_BATCH_SIZE" -gt 0 ]; then
+              echo ""
+              echo "=== Batch $BATCH_NUM: $((CURRENT_BATCH_SIZE / 1024 / 1024)) MB ==="
+              git commit -m "Batch $BATCH_NUM: $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet
+
+              if [ "$COMMIT_MADE" -eq 0 ]; then
+                git push --force origin "$BRANCH"
+                COMMIT_MADE=1
+              else
+                git push origin "$BRANCH"
+              fi
+
+              BATCH_NUM=$((BATCH_NUM + 1))
+              CURRENT_BATCH_SIZE=0
+
+              if [ "$PUSH_DELAY_SECONDS" -gt 0 ]; then
+                echo "Sleeping ${PUSH_DELAY_SECONDS}s before next batch..."
+                sleep "$PUSH_DELAY_SECONDS"
+              fi
+            fi
+
+            git add "$file"
+            CURRENT_BATCH_SIZE=$((CURRENT_BATCH_SIZE + FILE_SIZE))
+          done < <(find . -type f -not -path './.git/*' -print0)
+
+          # Final batch (whatever remains)
+          if [ "$CURRENT_BATCH_SIZE" -gt 0 ]; then
+            echo ""
+            echo "=== Final batch ($BATCH_NUM): $((CURRENT_BATCH_SIZE / 1024 / 1024)) MB ==="
+            git commit -m "Batch $BATCH_NUM (final): $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet
+            if [ "$COMMIT_MADE" -eq 0 ]; then
+              git push --force origin "$BRANCH"
+            else
+              git push origin "$BRANCH"
+            fi
+          fi
+
+          echo ""
+          echo "Done. Processed $TOTAL_FILES file(s) in $BATCH_NUM batch(es). Branch: $BRANCH"
