@@ -16,10 +16,10 @@ on:
           - 256kbps
         default: 128kbps
       enforce_256kbps:
-        description: "Remove tracks below 200kbps and fail if all are removed (default: keep everything)"
+        description: "Remove tracks below 200kbps (default ON — uncheck to keep all quality levels)"
         required: false
         type: boolean
-        default: false
+        default: true
       branch_name:
         description: "Branch name override (default: UTC date + run number, e.g. 2026-11-18-r12)"
         required: false
@@ -41,12 +41,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Cache warm-up ──────────────────────────────────────────────
       - name: Compute weekly cache key
         id: week
         run: echo "WEEK_NUM=$(date -u +%Y-%V)" >> "$GITHUB_OUTPUT"
 
-      # ── Python + pip wheel cache ───────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -60,14 +58,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ── ffmpeg (cached via awalsh128 action) ───────────────────────
       - name: Cache and install ffmpeg
         uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
           packages: ffmpeg
           version: 1.0
 
-      # ── Deno (binary already cached by setup-deno; enable dep cache) ─
       - name: Set up Deno
         uses: denoland/setup-deno@v2
         with:
@@ -85,7 +81,6 @@ jobs:
           ffmpeg -version | head -n 1
           deno --version
 
-      # ── Everything below is unchanged ──────────────────────────────
       - name: Prepare cookies
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
@@ -105,6 +100,25 @@ jobs:
             echo "::error::cookies.txt contains no youtube.com cookies. Re-export while logged in at music.youtube.com."
             exit 1
           fi
+
+      - name: Save expected track list
+        env:
+          SPOTIFY_URL: ${{ inputs.spotify_url }}
+        run: |
+          mkdir -p "$RUNNER_TEMP"
+          set +e
+          spotdl save "$SPOTIFY_URL" --save-file "$RUNNER_TEMP/expected.spotdl" 2>&1 | tee "$RUNNER_TEMP/save.log"
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ] && [ -f "$RUNNER_TEMP/expected.spotdl" ]; then
+            EXPECTED_COUNT=$(jq '.tracks // [.] | length' "$RUNNER_TEMP/expected.spotdl" 2>/dev/null || echo "unknown")
+            echo "Expected track count: $EXPECTED_COUNT"
+            jq -r '.tracks // [.] | .[] | .name' "$RUNNER_TEMP/expected.spotdl" > "$RUNNER_TEMP/expected-tracks.txt" 2>/dev/null
+            echo "--- Expected tracks ---"
+            cat "$RUNNER_TEMP/expected-tracks.txt"
+          else
+            echo "::warning::Could not save expected track list — missing-detection will be skipped this run."
+          fi
+          exit 0
 
       - name: Download audio (YouTube Music)
         env:
@@ -126,7 +140,6 @@ jobs:
           echo "First pass exit code: $RC"
           if [ "$RC" -ne 0 ]; then
             echo "::warning::spotdl first pass failed with exit code $RC"
-            echo "--- Last 30 lines of spotdl log ---"
             tail -30 spotdl-errors.log
           fi
           exit 0
@@ -223,19 +236,61 @@ jobs:
             echo "========================="
           fi
 
+      - name: Detect missing tracks
+        run: |
+          MISSING_FILE="$RUNNER_TEMP/missing-tracks.txt"
+          : > "$MISSING_FILE"
+
+          ACTUAL=$(find downloads -type f -name '*.m4a' | wc -l)
+          echo "Downloaded: $ACTUAL track(s)"
+
+          if [ ! -f "$RUNNER_TEMP/expected-tracks.txt" ]; then
+            echo "::warning::No expected track list available — skipping missing detection."
+            exit 0
+          fi
+
+          EXPECTED=$(wc -l < "$RUNNER_TEMP/expected-tracks.txt")
+          echo "Expected: $EXPECTED track(s)"
+
+          find downloads -type f -name '*.m4a' -printf '%f\n' | sed 's|\.[^.]*$||' > "$RUNNER_TEMP/downloaded-files.txt"
+
+          MISSING=0
+          while IFS= read -r track_name; do
+            [ -z "$track_name" ] && continue
+            if ! grep -Fqi "$track_name" "$RUNNER_TEMP/downloaded-files.txt"; then
+              echo "MISSING: $track_name"
+              echo "$track_name" >> "$MISSING_FILE"
+              MISSING=$((MISSING + 1))
+            fi
+          done < "$RUNNER_TEMP/expected-tracks.txt"
+
+          echo ""
+          echo "===== SUMMARY ====="
+          echo "Expected   : $EXPECTED"
+          echo "Downloaded : $ACTUAL"
+          echo "Missing    : $MISSING"
+          echo "==================="
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo ""
+            echo "===== MISSING TRACKS ====="
+            cat "$MISSING_FILE"
+            echo "=========================="
+          fi
+
       - name: Verify downloads
         run: |
           COUNT=$(find downloads -type f -name '*.m4a' | wc -l)
           echo "Audio file count: $COUNT"
           echo "Total download size: $(du -sh downloads | cut -f1)"
-          echo "--- Tree ---"
+          echo "--- Tree (first 40) ---"
           find downloads -type f | head -40
 
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::No audio files were downloaded. Below is the spotdl log:"
             tail -80 spotdl-errors.log 2>/dev/null || echo "(log not found)"
             echo ""
-            echo "If enforcement is ON, all tracks may have been below 200kbps and removed. Check the 'Enforce 256kbps' step above."
+            echo "If enforcement is ON (default), all tracks may have been below 200kbps and removed. Uncheck 'enforce_256kbps' and re-run to keep all qualities."
             exit 1
           fi
 
@@ -245,6 +300,7 @@ jobs:
           cp -a downloads/. "$RUNNER_TEMP/spotdl-out/"
           cp -f spotdl-errors.log "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
           cp -f "$RUNNER_TEMP/removed-128kbps.txt" "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
+          cp -f "$RUNNER_TEMP/missing-tracks.txt" "$RUNNER_TEMP/spotdl-out/" 2>/dev/null || true
 
       - name: Push to orphan branch (batched)
         env:
