@@ -95,14 +95,14 @@ jobs:
           mkdir -p downloads
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
+            --output "downloads/{list-name}/{list-position} - {artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
             --cookie-file cookies.txt \
             --generate-lrc \
             --lyrics synced genius \
-            --restrict ascii \
+            --restrict none \
             --print-errors 2>&1 | tee spotdl-errors.log
           RC=${PIPESTATUS[0]}
           echo "First pass exit code: $RC"
@@ -124,14 +124,14 @@ jobs:
           echo "First pass produced no files. Trying --audio youtube as fallback..."
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
+            --output "downloads/{list-name}/{list-position} - {artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube \
             --cookie-file cookies.txt \
             --generate-lrc \
             --lyrics synced genius \
-            --restrict ascii \
+            --restrict none \
             --print-errors 2>&1 | tee -a spotdl-errors.log
           RC=${PIPESTATUS[0]}
           echo "Fallback pass exit code: $RC"
@@ -147,14 +147,14 @@ jobs:
         run: |
           set +e
           spotdl download "$SPOTIFY_URL" \
-            --output "downloads/{list-name}/{artist} - {title}.{output-ext}" \
+            --output "downloads/{list-name}/{list-position} - {artist} - {title}.{output-ext}" \
             --format m4a \
             --bitrate disable \
             --audio youtube-music \
             --cookie-file cookies.txt \
             --generate-lrc \
             --lyrics synced genius \
-            --restrict ascii \
+            --restrict none \
             --overwrite skip \
             --print-errors 2>&1 | tee -a spotdl-errors.log
           RC=${PIPESTATUS[0]}
