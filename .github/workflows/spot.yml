@@ -41,21 +41,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── Cache warm-up ──────────────────────────────────────────────
+      - name: Compute weekly cache key
+        id: week
+        run: echo "WEEK_NUM=$(date -u +%Y-%V)" >> "$GITHUB_OUTPUT"
+
+      # ── Python + pip wheel cache ───────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ steps.week.outputs.WEEK_NUM }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
+      # ── ffmpeg (cached via awalsh128 action) ───────────────────────
+      - name: Cache and install ffmpeg
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: ffmpeg
+          version: 1.0
+
+      # ── Deno (binary already cached by setup-deno; enable dep cache) ─
       - name: Set up Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+          cache: true
 
       - name: Install spotdl
         run: |
@@ -68,6 +85,7 @@ jobs:
           ffmpeg -version | head -n 1
           deno --version
 
+      # ── Everything below is unchanged ──────────────────────────────
       - name: Prepare cookies
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
