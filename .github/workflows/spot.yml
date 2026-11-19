@@ -16,10 +16,10 @@ on:
           - 256kbps
         default: 128kbps
       enforce_256kbps:
-        description: "Remove tracks below 200kbps (default ON — uncheck to keep all quality levels)"
+        description: "Remove tracks below 200kbps and fail if all are removed (default: keep everything)"
         required: false
         type: boolean
-        default: true
+        default: false
       branch_name:
         description: "Branch name override (default: UTC date + run number, e.g. 2026-11-18-r12)"
         required: false
@@ -289,8 +289,6 @@ jobs:
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::No audio files were downloaded. Below is the spotdl log:"
             tail -80 spotdl-errors.log 2>/dev/null || echo "(log not found)"
-            echo ""
-            echo "If enforcement is ON (default), all tracks may have been below 200kbps and removed. Uncheck 'enforce_256kbps' and re-run to keep all qualities."
             exit 1
           fi
 
